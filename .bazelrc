@@ -1,0 +1,8 @@
+build --compilation_mode=opt
+build --force_pic=yes
+build --strip=never
+build --cxxopt=-std=c++17
+build --host_cxxopt=-std=c++17
+
+build --test_output=errors
+build --test_summary=terse
