@@ -1,0 +1,810 @@
+/*
+ * TODO: This license is not consistent with license used in the project.
+ *       Delete the inconsistent license and above line and rerun pre-commit to
+ * insert a good license. Copyright © 2022 Dexai Robotics. All rights reserved.
+ */
+
+#include <math.h> /* atan2 */
+
+// drake headers
+#include <drake/common/polynomial.h>
+
+#include "drake/common/autodiff.h"
+#include "drake/common/trajectories/piecewise_polynomial.h"
+#include "drake/math/autodiff_gradient.h"
+
+// dexai headers
+#include "constraint_solver.h"
+#include "drac_types.h"
+#include "spline_optimization.h"
+
+template <typename T>
+ConstraintChecker<T>::ConstraintChecker(const std::string& name,
+                                        double activation_threshold,
+                                        double repel_threshold)
+    : cost_ {static_cast<T>(0)},
+      min_distance_ {static_cast<T>(std::numeric_limits<double>::max())},
+      name_ {name},
+      activation_threshold_ {activation_threshold},
+      repel_threshold_ {repel_threshold} {
+      log()->info(
+      "ConstraintChecker::Built an constraint checker for {} with activation "
+      "at {}",
+      name_, activation_threshold_);
+}
+
+
+// template <typename T>
+template <>
+void ConstraintChecker<drake::AutoDiffXd>::Evaluate() {
+  auto start = std::chrono::high_resolution_clock::now();
+  double min_distance_value {min_distance_.value()};
+  repel_threshold_ = std::min(min_distance_value, repel_threshold_);
+  log()->warn("ConstraintChecker::{} repelling threshold is {}", name_,
+              repel_threshold_);
+  for (size_t i = 0; i < distances_.size(); i++) {
+    cost_ += 1 / Eigen::pow(distances_[i] - repel_threshold_ + 0.001, 2);
+  }
+  log()->debug(
+      "ConstraintChecker::{} cost is {} and Minimum Distance is {} [mm]", name_,
+      cost_, min_distance_value * 1000);
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug("ConstraintChecker:: Evaluated in {} microseconds",
+               duration.count());
+  distances_.clear();
+}
+
+template <>
+void ConstraintChecker<double>::Evaluate() {
+  for (size_t i = 0; i < distances_.size(); i++) {
+    if (distances_[i] > repel_threshold_) {
+      cost_ += 1 / pow(distances_[i] - repel_threshold_ + 0.001, 2);
+    } else {
+      cost_ = std::numeric_limits<double>::max();
+      break;
+    }
+  }
+  log()->debug("ConstraintChecker::{} cost is {} and Minimum Distance is {}",
+               name_, cost_, min_distance_);
+  distances_.clear();
+}
+
+SplineOptimizer::SplineOptimizer(std::vector<drake::MatrixX<double>>& waypts) {
+  waypts_ = waypts;
+  dim_ = static_cast<size_t>(waypts_[0].size());
+  for (size_t k {0}; k < waypts_.size(); k++) {
+    breaks_.push_back(static_cast<double>(k));
+    drake::MatrixX<drake::AutoDiffXd> sample_ad(dim_, 1);
+    for (size_t i {}; i < dim_; i++) {
+      sample_ad(i, 0) = drake::AutoDiffXd(waypts_[k](i, 0),
+                                          dim_ * waypts_.size(), dim_ * k + i);
+    }
+    waypts_ad_.push_back(sample_ad);
+  }
+  spline_ = PPType_ad::CubicWithContinuousSecondDerivatives(breaks_, waypts_ad_,
+                                                            Eigen::MatrixXd::Zero(dim_, 1), Eigen::MatrixXd::Zero(dim_, 1));
+  momap::log()->info("Built an SplineOptimizer with Box Limits!");
+}
+
+SplineOptimizer::SplineOptimizer(std::vector<drake::MatrixX<double>>& waypts,
+                                 std::shared_ptr<ConstraintSolver> cs,
+                                 const params& parameters)
+    : waypts_ {waypts},
+      cs_ {cs},
+      dim_ {static_cast<size_t>(waypts_[0].size())},
+      parameters_ {parameters} {
+  for (size_t k {0}; k < waypts_.size(); k++) {
+    breaks_.push_back(static_cast<double>(k));
+    breaks_double_.push_back(static_cast<double>(k));
+    drake::MatrixX<drake::AutoDiffXd> sample_ad(dim_, 1);
+    for (size_t i {}; i < dim_; i++) {
+      sample_ad(i, 0) = drake::AutoDiffXd(waypts_[k](i, 0),
+                                          dim_ * waypts_.size(), dim_ * k + i);
+    }
+    waypts_ad_.push_back(sample_ad);
+  }
+  spline_ = PPType_ad::CubicWithContinuousSecondDerivatives(breaks_, waypts_ad_,
+                                                            Eigen::MatrixXd::Zero(dim_, 1), Eigen::MatrixXd::Zero(dim_, 1));
+  collision_checker_ptr_ =
+      std::make_unique<ConstraintChecker<drake::AutoDiffXd>>("CollisionChecker",
+                                                             collision_cutoff);
+  jointlimit_checker_ptr_ =
+      std::make_unique<ConstraintChecker<drake::AutoDiffXd>>(
+          "JointLimitsChecker", jointlimit_cutoff);
+  collision_checker_temp_ptr_ = std::make_unique<ConstraintChecker<double>>(
+      "Tempcollision_checker", collision_cutoff);
+  jointlimit_checker_temp_ptr_ = std::make_unique<ConstraintChecker<double>>(
+      "TempJointLimit", jointlimit_cutoff);
+  momap::log()->info(
+      "Built a spline optimizer from waypts with Dracula! \n dim= {} "
+      "#waypts={}",
+      dim_, waypts_.size());
+}
+
+SplineOptimizer::SplineOptimizer(const system_poly_t& syspoly,
+                                 std::shared_ptr<ConstraintSolver> cs,
+                                 const params& parameters,
+                                 int n_waypts) {
+  cs_ = cs;
+  parameters_ = parameters;
+  double t_start {syspoly.begin()->second.start_time()};
+  double t_end {syspoly.begin()->second.end_time()};
+  double time_step {(t_end - t_start) / (n_waypts-1) + 0.00001};
+  auto sysconf_vec {dru::ToSysConfVec(syspoly, time_step)};
+  for (auto sysconf : sysconf_vec) {
+    Eigen::VectorXd q_config {cs_->PackModelAccelerations(sysconf)};
+    waypts_.push_back(q_config);
+  }
+  dim_ = static_cast<size_t>(waypts_[0].size());
+  // Now the usual construction
+  const auto v_start {Eigen::MatrixXd::Zero(dim_, 1)};
+  const auto v_end {Eigen::MatrixXd::Zero(dim_, 1)};
+  for (size_t k {0}; k < waypts_.size(); k++) {
+    breaks_.push_back(static_cast<double>(k * time_step));
+    breaks_double_.push_back(static_cast<double>(k * time_step));
+    drake::MatrixX<drake::AutoDiffXd> sample_ad(dim_, 1);
+    for (size_t i {}; i < dim_; i++) {
+      sample_ad(i, 0) = drake::AutoDiffXd(waypts_[k](i, 0),
+                                          dim_ * waypts_.size(), dim_ * k + i);
+    }
+    waypts_ad_.push_back(sample_ad);
+  }
+  spline_ = PPType_ad::CubicWithContinuousSecondDerivatives(breaks_, waypts_ad_,
+                                                            v_start, v_end);
+  collision_checker_ptr_ =
+      std::make_unique<ConstraintChecker<drake::AutoDiffXd>>(
+          "collision_checker", collision_cutoff);
+  jointlimit_checker_ptr_ =
+      std::make_unique<ConstraintChecker<drake::AutoDiffXd>>(
+          "JointLimitsChecker", jointlimit_cutoff);
+  collision_checker_temp_ptr_ = std::make_unique<ConstraintChecker<double>>(
+      "Tempcollision_checker", collision_cutoff);
+  jointlimit_checker_temp_ptr_ = std::make_unique<ConstraintChecker<double>>(
+      "TempJointLimitsChecker", jointlimit_cutoff);
+  momap::log()->info(
+      "Built a spline optimizer from a syspoly with Dracula! \n dim= {} "
+      "#waypts={}",
+      dim_, waypts_.size());
+}
+
+template <>
+void SplineOptimizer::CalcBoxLimitsCost(
+    drake::trajectories::PiecewisePolynomial<drake::AutoDiffXd>& spline,
+    Eigen::VectorXd& upper_limit, Eigen::VectorXd& lower_limit) {
+  jointlimit_checker_ptr_->Reset();
+  for (size_t i {}; i < dim_; i++) {
+    for (size_t k = 0; k < breaks_.size() - 1; k++) {
+      // std::cout << "i = " << i << " and k = " << k << std::endl;
+      drake::Polynomial<drake::AutoDiffXd> my_poly = spline.getPolynomialMatrix(k)(i, 0);
+      const auto cof = my_poly.GetCoefficients();
+      // Solve the second root problem
+      auto delta_t = breaks_[k + 1] - breaks_[k];
+      auto delta_squared = Eigen::pow(cof(2), 2) - 3 * cof(1) * cof(3);
+      std::vector<drake::AutoDiffXd> candidates;  // All points with
+                                  // derivative=0
+      candidates.push_back(0);
+      if (k == breaks_.size() - 2) {
+        candidates.push_back(delta_t);
+      }  // consider last point
+      if (std::abs(cof(3).value()) < 1e-6 && std::abs(cof(2).value()) > 1e-6) {
+        candidates.push_back(-cof(1) / 2 / cof(2));
+        // std::cout << "degree 1" << std::endl;
+      } else if (delta_squared.value() > 0) {
+        // the roots are real
+        const auto root_1 = (-cof(2) + Eigen::sqrt(delta_squared)) / 3 / cof(3);
+        const auto root_2 = (-cof(2) - Eigen::sqrt(delta_squared)) / 3 / cof(3);
+        // std::cout << "roots are = " << root_1 << " and " << root_2 <<
+        // std::endl;
+        if (root_1 > 0 && root_1 < delta_t) {
+          candidates.push_back(root_1);
+        }
+        if (root_2 > 0 && root_2 < delta_t) {
+          candidates.push_back(root_2);
+        }
+        // std::cout << "roots are = " << root_1 << " and " << root_2 <<
+        // std::endl;
+      }
+      for (const auto& t : candidates) {
+        auto val = cof(0) + cof(1) * t + cof(2) * Eigen::pow(t, 2)
+                   + cof(3) * Eigen::pow(t, 3);
+        // std::cout << "t = " << t << " val = " << val << std::endl;
+        if (upper_limit(i) - val
+            < jointlimit_checker_ptr_->activation_threshold()) {
+          jointlimit_checker_ptr_->Push(upper_limit(i) - val);
+          ;
+        }
+        if (val - lower_limit(i)
+            < jointlimit_checker_ptr_->activation_threshold()) {
+          jointlimit_checker_ptr_->Push(val - lower_limit(i));
+          ;
+        }
+      }
+    }
+  }
+  jointlimit_checker_ptr_->Evaluate();
+  jointlimit_checker_temp_ptr_->set_repel_threshold(
+      jointlimit_checker_ptr_->repel_threshold());
+}
+
+template <>
+void SplineOptimizer::CalcBoxLimitsCost(
+    drake::trajectories::PiecewisePolynomial<double>& spline,
+    Eigen::VectorXd& upper_limit, Eigen::VectorXd& lower_limit) {
+  jointlimit_checker_temp_ptr_->Reset();
+  for (size_t i {}; i < dim_; i++) {
+    for (size_t k = 0; k < breaks_double_.size() - 1; k++) {
+      // std::cout << "i = " << i << " and k = " << k << std::endl;
+      drake::Polynomial<double> my_poly = spline.getPolynomialMatrix(k)(i, 0);
+      const auto cof = my_poly.GetCoefficients();
+      // Solve the second root problem
+      auto delta_t = breaks_double_[k + 1] - breaks_double_[k];
+      auto delta_squared = std::pow(cof(2), 2) - 3 * cof(1) * cof(3);
+      std::vector<double> candidates;  // All points with
+                                       // derivative=0
+      candidates.push_back(0);
+      if (k == breaks_.size() - 2) {
+        candidates.push_back(delta_t);
+      }  // consider last point
+      if (std::abs(cof(3)) < 1e-6 && std::abs(cof(2)) > 1e-6) {
+        candidates.push_back(-cof(1) / 2 / cof(2));
+      } else if (delta_squared > 0) {
+        // the roots are real
+        const auto root_1 = (-cof(2) + std::sqrt(delta_squared)) / 3 / cof(3);
+        const auto root_2 = (-cof(2) - std::sqrt(delta_squared)) / 3 / cof(3);
+        if (root_1 > 0 && root_1 < delta_t) {
+          candidates.push_back(root_1);
+        }
+        if (root_2 > 0 && root_2 < delta_t) {
+          candidates.push_back(root_2);
+        }
+      }
+      for (const auto& t : candidates) {
+        auto val = cof(0) + cof(1) * t + cof(2) * std::pow(t, 2)
+                   + cof(3) * std::pow(t, 3);
+        if (upper_limit(i) - val
+            < jointlimit_checker_temp_ptr_->activation_threshold()) {
+          jointlimit_checker_temp_ptr_->Push(upper_limit(i) - val);
+          ;
+        }
+        if (val - lower_limit(i)
+            < jointlimit_checker_temp_ptr_->activation_threshold()) {
+          jointlimit_checker_temp_ptr_->Push(val - lower_limit(i));
+          ;
+        }
+      }
+    }
+  }
+  jointlimit_checker_temp_ptr_->Evaluate();
+}
+
+template <>
+void SplineOptimizer::CalcJointLimitsCost(
+    drake::trajectories::PiecewisePolynomial<double>& spline) {
+  const auto& cobot_name {parameters_.GetCobotName()};
+  const auto& aa_name {parameters_.GetAncillaryArmName()};
+  const auto cobot_joint_limits {
+      parameters_.planning_limits_map.at(cobot_name)->joint_limits};
+  const auto aa_joint_limits {
+      parameters_.planning_limits_map.at(aa_name)->joint_limits};
+  system_conf_t sys_conf_upper_limit, sys_conf_lower_limit;
+  sys_conf_upper_limit[cobot_name] = cobot_joint_limits.upper_limits;
+  sys_conf_lower_limit[cobot_name] = cobot_joint_limits.lower_limits;
+  sys_conf_upper_limit[aa_name] = aa_joint_limits.upper_limits;
+  sys_conf_lower_limit[aa_name] = aa_joint_limits.lower_limits;
+  Eigen::VectorXd upper_limit =
+      cs_->PackModelAccelerations(sys_conf_upper_limit);
+  Eigen::VectorXd lower_limit =
+      cs_->PackModelAccelerations(sys_conf_lower_limit);
+  CalcBoxLimitsCost<double>(spline, upper_limit, lower_limit);
+}
+
+template <>
+void SplineOptimizer::CalcJointLimitsCost(
+    drake::trajectories::PiecewisePolynomial<drake::AutoDiffXd>& spline) {
+  const auto& cobot_name {parameters_.GetCobotName()};
+  const auto& aa_name {parameters_.GetAncillaryArmName()};
+  const auto cobot_joint_limits {
+      parameters_.planning_limits_map.at(cobot_name)->joint_limits};
+  const auto aa_joint_limits {
+      parameters_.planning_limits_map.at(aa_name)->joint_limits};
+  system_conf_t sys_conf_upper_limit, sys_conf_lower_limit;
+  sys_conf_upper_limit[cobot_name] = cobot_joint_limits.upper_limits;
+  sys_conf_lower_limit[cobot_name] = cobot_joint_limits.lower_limits;
+  sys_conf_upper_limit[aa_name] = aa_joint_limits.upper_limits;
+  sys_conf_lower_limit[aa_name] = aa_joint_limits.lower_limits;
+  Eigen::VectorXd upper_limit =
+      cs_->PackModelAccelerations(sys_conf_upper_limit);
+  Eigen::VectorXd lower_limit =
+      cs_->PackModelAccelerations(sys_conf_lower_limit);
+  CalcBoxLimitsCost<drake::AutoDiffXd>(spline, upper_limit, lower_limit);
+}
+
+template <>
+void SplineOptimizer::CalcCollisionCost(
+    std::vector<drake::MatrixX<double>>& waypts_vec) {
+  auto start = std::chrono::high_resolution_clock::now();
+  std::vector<drake::AutoDiffXd> distance_vector;
+  collision_checker_temp_ptr_->Reset();
+  system_conf_t sys_conf {cs_->SysConfZero()};
+  for (size_t k {1}; k < waypts_vec.size() -1; k++) {
+    auto waypt {waypts_vec[k]};
+    cs_->UnpackModelAccelerations(waypt, sys_conf);
+    auto dist_vec {cs_->GetCollisionGradients(
+        sys_conf, collision_checker_ptr_->activation_threshold())};
+    for (auto& dist : dist_vec) {
+      if (collision_checker_temp_ptr_->repel_threshold()
+          > dist.value() + 0.001) {
+        momap::log()->trace("k={}, d = {}, repel_threshold = {}", k,
+                            dist.value(),
+                            collision_checker_temp_ptr_->repel_threshold());
+        collision_checker_temp_ptr_->SetInfinityCost();
+        return;
+      } else {
+        momap::log()->trace("k={}, d = {}", k, dist.value());
+        collision_checker_temp_ptr_->Push(dist.value());
+      }
+    }
+  }
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug("Collisions at {} points evaluated in {} microseconds",
+               waypts_vec.size(), duration.count());
+  collision_checker_temp_ptr_->Evaluate();
+}
+
+template <>
+void SplineOptimizer::CalcCollisionCost(
+    std::vector<drake::MatrixX<drake::AutoDiffXd>>& waypts_vec) {
+  auto start = std::chrono::high_resolution_clock::now();
+  std::vector<drake::AutoDiffXd> distance_vector;
+  collision_checker_ptr_->Reset();
+  system_conf_t sys_conf {cs_->SysConfZero()};
+  // For recording the distance-to-collision trajectory
+  min_distance_trajectory_.first.clear();
+  min_distance_trajectory_.second.clear();
+  for (size_t k {0}; k < waypts_vec.size(); k++) {
+    auto waypt {waypts_vec[k]};
+    auto q_value = drake::math::ExtractValue(waypt);
+    cs_->UnpackModelAccelerations(q_value, sys_conf);
+    auto knot_dist_vec {cs_->GetCollisionGradients(
+        sys_conf, collision_checker_ptr_->activation_threshold())};
+    double min_distance_knot {collision_checker_ptr_->activation_threshold()};
+    for (auto& dist : knot_dist_vec) {
+      Eigen::VectorXd gradient {
+          Eigen::VectorXd::Zero(dim_ * waypts_vec.size())};
+      if (dist.value()>0){
+          gradient.segment(k * dim_, dim_) = dist.derivatives();
+      }
+      else {
+          gradient.segment(k * dim_, dim_) = dist.derivatives();
+          log()->warn("made the gradient reverse {}", dist.value());
+      }
+      drake::AutoDiffXd distance_autodiff_spline =
+          Eigen::MakeAutoDiffScalar(dist.value(), gradient);
+      collision_checker_ptr_->Push(distance_autodiff_spline);
+      min_distance_knot = std::min(min_distance_knot, dist.value());
+    }
+    min_distance_trajectory_.first.push_back(k);
+    min_distance_trajectory_.second.push_back(min_distance_knot
+                                              * 1000);  // m to mm
+  }
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug("Collisions at {} points evaluated in {} microseconds",
+               waypts_vec.size(), duration.count());
+  collision_checker_ptr_->Evaluate();
+  collision_checker_temp_ptr_->set_repel_threshold(
+      collision_checker_ptr_->repel_threshold());
+}
+
+template <>
+void SplineOptimizer::CalcCollisionCost(
+    drake::trajectories::PiecewisePolynomial<double>& spline, int n_points) {
+  auto start = std::chrono::high_resolution_clock::now();
+  EASY_BLOCK("CalcCollisionCost Autodiff")
+  // Divide the spline into segments
+  double t_start {spline.start_time()};
+  double t_end {spline.end_time()};
+  const auto check_times {Eigen::VectorXd::LinSpaced(n_points, t_start, t_end)};
+  collision_checker_temp_ptr_->Reset();
+  system_conf_t sys_conf {cs_->SysConfZero()};
+  for (auto t : check_times) {
+    drake::MatrixX<double> q_value = spline.value(t);
+    cs_->UnpackModelAccelerations(q_value, sys_conf);
+    auto dist_vec {cs_->GetCollisionGradients(
+        sys_conf, collision_checker_temp_ptr_->activation_threshold())};
+    for (auto& dist : dist_vec) {
+      if (collision_checker_temp_ptr_->repel_threshold()
+          > dist.value() + 0.001) {
+        momap::log()->error("t={}, d = {}, repel_threshold = {}", t,
+                            dist.value(),
+                            collision_checker_temp_ptr_->repel_threshold());
+        collision_checker_temp_ptr_->SetInfinityCost();
+        return;
+      } else {
+        momap::log()->trace("t={}, d = {}", t, dist.value());
+        collision_checker_temp_ptr_->Push(dist.value());
+      }
+    }
+  }
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug(
+      "CalcCollisionCost Collision gradients at {} points evaluated in {} "
+      "microseconds",
+      n_points, duration.count());
+  EASY_END_BLOCK;
+  collision_checker_temp_ptr_->Evaluate();
+}
+
+template <>
+void SplineOptimizer::CalcCollisionCost(
+    drake::trajectories::PiecewisePolynomial<drake::AutoDiffXd>& spline,
+    int n_points) {
+  auto start = std::chrono::high_resolution_clock::now();
+  // For recording the distance-to-collision trajectory
+  min_distance_trajectory_.first.clear();
+  min_distance_trajectory_.second.clear();
+  // Divide the spline into segments
+  double t_start = (spline.start_time()).value();
+  double t_end {(spline.end_time()).value()};
+  const auto check_times {Eigen::VectorXd::LinSpaced(n_points, t_start, t_end)};
+  collision_checker_ptr_->Reset();
+  system_conf_t sys_conf {cs_->SysConfZero()};
+  for (auto t : check_times) {
+    drake::MatrixX<drake::AutoDiffXd> q_autodiff = spline.value(t);
+    auto q_value = drake::math::ExtractValue(q_autodiff);
+    cs_->UnpackModelAccelerations(q_value, sys_conf);
+    auto dist_vec {cs_->GetCollisionGradients(
+        sys_conf, collision_checker_ptr_->activation_threshold())};
+    double min_distance_knot {collision_checker_ptr_->activation_threshold()};
+    for (auto& dist : dist_vec) {
+      if (min_distance_knot > dist.value()) {
+        min_distance_knot = dist.value();
+      }
+      momap::log()->trace("t={}, d = {}", t, dist.value());
+      auto dist_derivative_q = dist.derivatives();
+      Eigen::VectorXd gradient {
+          Eigen::VectorXd::Zero(q_autodiff(0).derivatives().size())};
+      for (size_t j {0}; j < dim_; j++) {
+        // chain rule to get the gradient of the distance function with respect
+        // to the spline waypts
+        gradient += dist_derivative_q(j, 0) * q_autodiff(j, 0).derivatives();
+      }
+      drake::AutoDiffXd distance_autodiff_spline =
+          Eigen::MakeAutoDiffScalar(dist.value(), gradient);
+      collision_checker_ptr_->Push(distance_autodiff_spline);
+    }
+    min_distance_trajectory_.first.push_back(t);
+    min_distance_trajectory_.second.push_back(min_distance_knot
+                                              * 1000);  // m to mm
+  }
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug(
+      "CalcCollisionCost Collision gradients at {} points evaluated in {} "
+      "microseconds",
+      n_points, duration.count());
+  collision_checker_ptr_->Evaluate();
+  collision_checker_temp_ptr_->set_repel_threshold(
+      collision_checker_ptr_->repel_threshold());
+}
+
+drake::AutoDiffXd softmin(drake::AutoDiffXd x, drake::AutoDiffXd y, double a = 1) {
+  if (x < 0.5 * y) {
+    return x;
+  } else if (x > 2 * y) {
+    return y;
+  } else {
+    return (x * Eigen::exp(-a * x) + y * Eigen::exp(-a * y))
+           / (Eigen::exp(-a * x) + Eigen::exp(-a * y));
+  }
+}
+
+double softmin(double x, double y, double a = 1) {
+  if (x < 0.5 * y) {
+    return x;
+  } else if (x > 2 * y) {
+    return y;
+  } else {
+    return (x * std::exp(-a * x) + y * std::exp(-a * y))
+           / (std::exp(-a * x) + std::exp(-a * y));
+  }
+}
+
+template <>
+drake::AutoDiffXd SplineOptimizer::CalcApproximateSplineTime(drake::trajectories::PiecewisePolynomial<drake::AutoDiffXd>& spline, const Eigen::VectorXd& vlim,
+                                  const Eigen::VectorXd& alim) {
+  drake::AutoDiffXd time {0};
+  double t_start{spline.start_time().value()};
+  double t_end{spline.end_time().value()};
+  int n_knots {300};
+  const auto knots {Eigen::VectorXd::LinSpaced(n_knots, t_start, t_end)};
+  for (int k = 0; k < n_knots - 1; k++) {
+    auto s = knots(k);
+    auto s_next = knots(k + 1);
+    auto delta = s_next - s;
+    auto qs_dot {spline.EvalDerivative(s, 1)};
+    auto qs_ddot {spline.EvalDerivative(s, 2)};
+    drake::AutoDiffXd sdot {std::numeric_limits<double>::max()};
+    for (size_t i = 0; i < dim_; i++) {
+      // Constraint 1: velocity limits
+      sdot = softmin(sdot, vlim(i) / Eigen::abs(qs_dot(i)));
+      // // Constraint 2: acceleration limits at current time
+      sdot = softmin(sdot, Eigen::sqrt(alim(i) / Eigen::abs(qs_ddot(i))));
+    }
+    auto delta_time = delta / sdot;
+    time += delta_time;
+  }
+  return time;
+}
+
+template <>
+double SplineOptimizer::CalcApproximateSplineTime(drake::trajectories::PiecewisePolynomial<double>& spline, const Eigen::VectorXd& vlim,
+                                  const Eigen::VectorXd& alim) {
+  EASY_FUNCTION(profiler::colors::Cyan);
+  double time {0};
+  auto t_start{spline.start_time()};
+  auto t_end{spline.end_time()};
+  int n_knots {300};
+  const auto knots {Eigen::VectorXd::LinSpaced(n_knots, t_start, t_end)};
+  for (int k = 0; k < n_knots - 1; k++) {
+    auto s = knots(k);
+    auto s_next = knots(k + 1);
+    auto delta = s_next - s;
+    auto qs_dot {spline.EvalDerivative(s, 1)};
+    auto qs_ddot {spline.EvalDerivative(s, 2)};
+    auto sdot {std::numeric_limits<double>::max()};
+    for (size_t i = 0; i < dim_; i++) {
+      // Constraint 1: velocity limits
+      sdot = softmin(sdot, vlim(i) / std::abs(qs_dot(i)));
+      // // Constraint 2: acceleration limits at current time
+      sdot = softmin(sdot, std::sqrt((alim(i) / std::abs(qs_ddot(i)))));
+    }
+    auto delta_time = delta / sdot;
+    time += delta_time;
+  }
+  return time;
+}
+
+template<typename T>
+T SplineOptimizer::CalcApproximateMultiRobotSplineTime(drake::trajectories::PiecewisePolynomial<T>& spline){
+  const auto& cobot_name {parameters_.GetCobotName()};
+  const auto& aa_name {parameters_.GetAncillaryArmName()};
+  system_conf_t sys_conf_vel_limit, sys_conf_acc_limit;
+  sys_conf_vel_limit [cobot_name] =
+      parameters_.planning_limits_map.at(cobot_name)->velocity_limits;
+  sys_conf_vel_limit [aa_name] =
+      parameters_.planning_limits_map.at(aa_name)->velocity_limits;
+  sys_conf_acc_limit [cobot_name] =
+      parameters_.planning_limits_map.at(cobot_name)->acceleration_limits;
+  sys_conf_acc_limit [aa_name] =
+      parameters_.planning_limits_map.at(aa_name)->acceleration_limits;
+  const Eigen::VectorXd vel_limit {cs_->PackModelAccelerations(sys_conf_vel_limit)};
+  const Eigen::VectorXd acc_limit {cs_->PackModelAccelerations(sys_conf_acc_limit)};
+  return CalcApproximateSplineTime<T>(spline, vel_limit, acc_limit);
+}
+
+template<>
+double SplineOptimizer::CalcSplineTime(drake::trajectories::PiecewisePolynomial<double>& spline){
+  return CalcApproximateMultiRobotSplineTime<double>(spline);
+}
+
+template<>
+drake::AutoDiffXd SplineOptimizer::CalcSplineTime(drake::trajectories::PiecewisePolynomial<drake::AutoDiffXd>& spline){
+  return CalcApproximateMultiRobotSplineTime<drake::AutoDiffXd>(spline);
+}
+
+double SplineOptimizer::BackTracking(drake::AutoDiffXd current_cost,
+                                     double initial_step, double alpha, double c) {
+  // Normalize the gradient
+  EASY_FUNCTION(profiler::colors::Magenta);
+  auto gradient {current_cost.derivatives().transpose()};
+  // don't move initial and final points
+  gradient.segment(0, dim_) = Eigen::VectorXd::Zero(dim_, 1);
+  gradient.segment(dim_ * (waypts_ad_.size() - 1), dim_) =
+      Eigen::VectorXd::Zero(dim_, 1);
+  // Normalize the gradient
+  if (gradient.lpNorm<Eigen::Infinity>() > 1e-6) {
+    gradient /= gradient.lpNorm<Eigen::Infinity>();
+  } else {
+    log()->warn("gradient is too small");
+    return 0;
+  }
+  log()->debug("gradient =  {}",gradient);
+  // Backtracking
+  auto step {initial_step};
+  for (int iter {0}; iter < 20; iter++) {
+    std::vector<drake::MatrixX<double>> waypts;
+    for (size_t k {0}; k < waypts_ad_.size(); k++) {
+      waypts.push_back(drake::math::ExtractValue(waypts_ad_[k]));
+      for (size_t i {0}; i < dim_; i++) {
+        if (k == 0 || k == waypts_ad_.size() - 1) {
+          continue;
+        } else {
+          waypts[k](i, 0) =
+              waypts_ad_[k](i, 0).value() - step * gradient(dim_ * k + i);
+        }
+      }
+      log()->debug("step = {} , k= {}, \n waypts = {}, \n waypt_ad = {}, \n diff = {}", step, k, waypts[k].transpose(),
+                   waypts_ad_[k].transpose(), waypts[k].transpose() - waypts_ad_[k].transpose());
+
+    }
+    auto spline_temp {PPType::CubicWithContinuousSecondDerivatives(
+        breaks_double_, waypts, Eigen::MatrixXd::Zero(dim_, 1),
+        Eigen::MatrixXd::Zero(dim_, 1))};
+    CalcCollisionCost<double>(spline_temp, 100);
+    // CalcCollisionCost<double>(waypts);
+    CalcJointLimitsCost<double>(spline_temp);
+    double collision_cost_temp {collision_checker_temp_ptr_->GetCost()};
+    double jointlimit_cost_temp {jointlimit_checker_temp_ptr_->GetCost()};
+    double time_cost {CalcSplineTime<double>(spline_temp)};
+    double cost_temp {collision_cost_temp + jointlimit_cost_temp + 1000*time_cost};
+    std::cout << "Temporary collision cost: " << collision_cost_temp
+              << " minimum collision margin = "
+              << collision_checker_temp_ptr_->GetMinimumDistance() << std::endl;
+    std::cout << "Temporary jointlimit cost: " << jointlimit_cost_temp
+              << " minimum jointlimit margin = "
+              << jointlimit_checker_temp_ptr_->GetMinimumDistance()
+              << std::endl;
+    std::cout << "Temporary time cost: " << 1000*time_cost << std::endl;
+    std::cout << "Temporary cost: " << cost_temp << std::endl;
+    if (current_cost.value() - cost_temp
+        >= c * step * std::pow(gradient.norm(), 2)) {
+      return step;
+    } else {
+      log()->debug("Backtracking decrease in cost: {} <=> threshold {}",
+                   current_cost.value() - cost_temp,
+                   c * step * std::pow(gradient.norm(), 2));
+      log()->debug("Backtracking: step {} iter = {}", step, iter);
+      step = alpha * step;
+      if (iter==10) {
+        log()->warn("Searching the reverse direction");
+        step = -initial_step;
+      }
+    }
+  }
+  return 0;
+}
+
+void SplineOptimizer::DescentOneStep() {
+  CalcJointLimitsCost<drake::AutoDiffXd>(spline_);
+  CalcCollisionCost<drake::AutoDiffXd>(spline_, 100);
+  // CalcCollisionCost<drake::AutoDiffXd>(waypts_ad_);
+  drake::AutoDiffXd jointlimit_cost {jointlimit_checker_ptr_->GetCost()};
+  drake::AutoDiffXd collision_cost {collision_checker_ptr_->GetCost()};
+  drake::AutoDiffXd time_cost {CalcSplineTime<drake::AutoDiffXd>(spline_)};
+  drake::AutoDiffXd current_cost {collision_cost + jointlimit_cost + 1000*time_cost};
+  std::cout << "\t *** collision cost: " << collision_cost
+            << " minimum collision margin = "
+            << collision_checker_ptr_->GetMinimumDistance() << std::endl;
+  std::cout << "\t *** jointlimit cost: " << jointlimit_cost
+            << " minimum jointlimit margin = "
+            << jointlimit_checker_ptr_->GetMinimumDistance() << std::endl;
+  std::cout << "\t *** cost: " << current_cost << std::endl;
+  if (current_cost.value() == 0) {
+    log()->critical("Optimization succesfull!");
+    convergence_ = true;
+    return;
+  }
+  double step {BackTracking(current_cost, 0.7, 0.6, 0.8)};
+  if (step == 0) {
+    log()->critical(
+        "Backtracking failed. This seems to be a local optimum. Stopping "
+        "optimization.");
+    convergence_ = true;
+    return;
+  }
+  // Normalize the gradient
+  auto gradient {current_cost.derivatives()};
+  // don't move initial and final points
+  gradient.segment(0, dim_) = Eigen::VectorXd::Zero(dim_, 1);
+  gradient.segment(dim_ * (waypts_ad_.size() - 1), dim_) =
+      Eigen::VectorXd::Zero(dim_, 1);
+  // Normalize the gradient
+  if (gradient.lpNorm<Eigen::Infinity>() > 1e-6) {
+    gradient /= gradient.lpNorm<Eigen::Infinity>();
+  }
+  for (size_t k {0}; k < waypts_ad_.size(); k++) {
+    for (size_t i {0}; i < dim_; i++) {
+      if (k == 0 || k == waypts_ad_.size() - 1) {
+        continue;
+      } else {
+        waypts_ad_[k](i, 0) -= step * gradient(dim_ * k + i);
+      }
+    }
+  }
+  spline_ = PPType_ad::CubicWithContinuousSecondDerivatives(
+      breaks_, waypts_ad_, Eigen::MatrixXd::Zero(dim_, 1),
+      Eigen::MatrixXd::Zero(dim_, 1));
+  collision_checker_ptr_->ResetHard();
+}
+
+void SplineOptimizer::Optimize(int max_iterations) {
+  for (int i {0}; i < max_iterations; i++) {
+    if (convergence_) {
+      break;
+    }
+    DescentOneStep();
+  }
+}
+
+robot_state_vec_t SplineOptimizer::GetPlan() {
+  robot_state_vec_t plan;
+  for (auto waypt_ad : waypts_ad_) {
+    auto waypt {drake::math::ExtractValue(waypt_ad)};
+    system_conf_t sys_conf {cs_->SysConfZero()};
+    cs_->UnpackModelAccelerations(waypt, sys_conf);
+    plan.push_back(cs_->ToState(sys_conf));
+  }
+  return plan;
+};
+
+
+// From the another file
+std::vector<drake::AutoDiffXd> SystemModel::CalcCollisionGradients(
+    const system_conf_t& sys_conf, const double distance_threshold) {
+  auto signed_distance_pairs {
+      RetrieveSignedDistancePairs(sys_conf, distance_threshold)};
+
+  // Query port used to find out results from scene graph
+  const auto& query_port = robots_plant_->get_geometry_query_input_port();
+
+  if (!query_port.HasValue(*plant_context_)) {
+    throw std::invalid_argument(
+        "Cannot get a valid geometry::QueryObject. "
+        "Either the plant geometry_query_input_port() is not properly "
+        "connected to the SceneGraph's output port, or the *plant_context_ is "
+        "incorrect. Please refer to AddMultibodyPlantSceneGraph on connecting "
+        "MultibodyPlant to SceneGraph.");
+  }
+
+  const auto& query_object =
+      query_port.Eval<QueryObject<double>>(*plant_context_);
+  const auto& inspector = query_object.inspector();
+
+  auto start = std::chrono::high_resolution_clock::now();
+  std::vector<drake::AutoDiffXd> collision_distances;
+  for (const auto& signed_distance_pair : signed_distance_pairs) {
+    const auto& frameA = robots_plant_
+                             ->GetBodyFromFrameId(inspector.GetFrameId(
+                                 signed_distance_pair.id_A))
+                             ->body_frame();
+    const auto& frameB = robots_plant_
+                             ->GetBodyFromFrameId(inspector.GetFrameId(
+                                 signed_distance_pair.id_B))
+                             ->body_frame();
+    auto p_ACa = signed_distance_pair.p_ACa;
+    auto nhat_BA_W = signed_distance_pair.nhat_BA_W;
+    auto distance = signed_distance_pair.distance;
+    drake::AutoDiffXd distance_autodiff;
+
+    auto q = robots_plant_->GetPositions(*plant_context_);
+    log()->debug("q={}", q.transpose());
+    drake::VectorX<drake::AutoDiffXd> q_ad(q.size());
+    for (int i = 0; i < q.size(); i++) {
+      drake::AutoDiffXd temp(q(0), q.size(), i);
+      q_ad(i) = temp;
+    }
+    drake::multibody::internal::CalcDistanceDerivatives(
+        *robots_plant_, *plant_context_, frameA, frameB, p_ACa, distance,
+        nhat_BA_W, q_ad, &distance_autodiff);
+    log()->debug("Distance between {} and {} = {} \nDistance Gradient={}", 
+    robots_plant_->GetBodyFromFrameId(inspector.GetFrameId(signed_distance_pair.id_A))->name(),
+    robots_plant_->GetBodyFromFrameId(inspector.GetFrameId(signed_distance_pair.id_B))->name(),
+    signed_distance_pair.distance, distance_autodiff.derivatives().transpose());
+    collision_distances.push_back(distance_autodiff);
+  }
+  auto stop = std::chrono::high_resolution_clock::now();
+  auto duration =
+      std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
+  log()->debug("checked {} pairs in {} microseconds",
+               signed_distance_pairs.size(), duration.count());
+  return collision_distances;
+}
