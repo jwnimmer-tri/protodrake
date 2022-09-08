@@ -1,4 +1,4 @@
-workspace(name = "drake_external_examples")
+workspace(name = "protodrake")
 
 # Before compiling this repository, you need to set which Drake sources to use:
 #  export LOCAL_DRAKE_PATH=/home/user/stuff/drake
