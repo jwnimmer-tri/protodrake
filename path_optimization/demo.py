@@ -100,7 +100,7 @@ def _solution_traj(*, traj_float, prog_result, sample_vars):
     return result
 
 
-def run():
+def _make_robot():
     # Create the motion planning plant.
     # TODO(jwnimmer-tri) Use RobotDiagramBuilder here instead.
     builder = DiagramBuilder()
@@ -109,6 +109,16 @@ def run():
         "protodrake/path_optimization/demo.dmd.yaml"))
     ProcessModelDirectives(directives, Parser(plant))
     plant.Finalize()
+    return builder, plant, scene_graph
+
+
+def _visualize(*, traj_sol):
+    builder, plant, scene_graph = _make_robot()
+    
+
+def run():
+    # Create the motion planning plant.
+    builder, plant, scene_graph = _make_robot()
     diagram = builder.Build()
     diagram_context = diagram.CreateDefaultContext()
     plant_context = plant.GetMyMutableContextFromRoot(diagram_context)
@@ -187,6 +197,9 @@ def run():
             ax.plot(s, x[dof, :], linewidth=2)
     filename = f"{os.environ['BUILD_WORKING_DIRECTORY']}/demo.png"
     plt.savefig(filename)
+
+    # Visualize
+    
 
 
 def main():
