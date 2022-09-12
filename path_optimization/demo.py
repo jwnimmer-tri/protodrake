@@ -1,11 +1,13 @@
 import logging
 import os.path
 import sys
+import time
 
 from bazel_tools.tools.python.runfiles.runfiles import Create as CreateRunfiles
 import matplotlib.pyplot as plt
 import numpy as np
 from pydrake.all import (
+    AddDefaultVisualization,
     AddMultibodyPlantSceneGraph,
     DiagramBuilder,
     Expression,
@@ -114,7 +116,21 @@ def _make_robot():
 
 def _visualize(*, traj_sol):
     builder, plant, scene_graph = _make_robot()
-    
+    AddDefaultVisualization(builder)
+    diagram = builder.Build()
+    diagram_context = diagram.CreateDefaultContext()
+    plant_context = plant.GetMyMutableContextFromRoot(diagram_context)
+
+    s_start = traj_sol.start_time()
+    s_end = traj_sol.end_time()
+    for i in range(2):
+        if i > 0:
+            time.sleep(0.5)
+        for s in np.linspace(s_start, s_end, 100):
+            plant.SetPositions(plant_context, traj_sol.value(s))
+            diagram.Publish(diagram_context)
+            time.sleep(0.01)
+
 
 def run():
     # Create the motion planning plant.
@@ -199,7 +215,7 @@ def run():
     plt.savefig(filename)
 
     # Visualize
-    
+    _visualize(traj_sol=traj_sol)
 
 
 def main():
