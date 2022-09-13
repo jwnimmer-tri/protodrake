@@ -1,0 +1,13 @@
+
+py_binary(
+    name = "demo",
+    srcs = ["demo.py"],
+    data = [
+        ":demo.dmd.yaml",
+        "@drake//manipulation/models/franka_description:prod_models",
+    ],
+    deps = [
+        "@bazel_tools//tools/python/runfiles",
+        "@drake//bindings/pydrake",
+    ],
+)

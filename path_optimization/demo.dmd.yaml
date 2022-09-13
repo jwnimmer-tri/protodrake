@@ -1,0 +1,7 @@
+directives:
+- add_model:
+    name: panda_arm
+    file: package://drake/manipulation/models/franka_description/urdf/panda_arm.urdf
+- add_weld:
+    parent: world
+    child: panda_arm::panda_link0
